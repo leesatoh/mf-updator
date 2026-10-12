@@ -2,21 +2,27 @@ import type { Locator, Page } from "playwright";
 
 const updateUrl = new URL("https://moneyforward.com/cf/update");
 
-export async function excludeFromCalculation(page: Page, row: Locator): Promise<void> {
+export async function setCalculationTarget(
+  page: Page,
+  row: Locator,
+  shouldBeTarget: boolean,
+): Promise<void> {
   const rowClass = (await row.getAttribute("class")) ?? "";
-  if (rowClass.includes("mf-grayout")) {
-    throw new Error("対象明細は既に計算対象外です。");
-  }
+  const isCurrentlyExcluded = rowClass.includes("mf-grayout");
+  if (isCurrentlyExcluded === !shouldBeTarget) throw new Error("対象明細は既に指定された状態です。");
 
   const form = row.locator("form.new_user_asset_act");
   const transactionId = await form.locator("input[name='user_asset_act[id]']").inputValue();
   const targetInput = form.locator("#user_asset_act_is_target");
   const targetValue = await targetInput.inputValue();
+  const expectedCurrentValue = shouldBeTarget ? "0" : "1";
+  const requestedTargetValue = shouldBeTarget ? "1" : "0";
   const action = await form.getAttribute("action");
   const formUrl = action ? new URL(action, page.url()) : null;
   if (
     !transactionId ||
-    targetValue !== "1" ||
+    targetValue !== expectedCurrentValue ||
+    isCurrentlyExcluded !== (targetValue === "0") ||
     formUrl?.origin !== updateUrl.origin ||
     formUrl.pathname !== updateUrl.pathname
   ) {
@@ -39,7 +45,7 @@ export async function excludeFromCalculation(page: Page, row: Locator): Promise<
       const fields = new URLSearchParams(body);
       return (
         fields.get("user_asset_act[id]") === transactionId &&
-        fields.get("user_asset_act[is_target]") === "0"
+        fields.get("user_asset_act[is_target]") === requestedTargetValue
       );
     },
     { timeout: 30000 },
@@ -53,7 +59,8 @@ export async function excludeFromCalculation(page: Page, row: Locator): Promise<
 
   const updatedClass = (await row.getAttribute("class")) ?? "";
   const updatedTargetValue = await targetInput.inputValue();
-  if (!updatedClass.includes("mf-grayout") || updatedTargetValue !== "0") {
-    throw new Error("画面上で計算対象OFFを確認できませんでした。");
+  const shouldBeExcluded = !shouldBeTarget;
+  if (updatedClass.includes("mf-grayout") !== shouldBeExcluded || updatedTargetValue !== requestedTargetValue) {
+    throw new Error(`画面上で計算対象${shouldBeTarget ? "ON" : "OFF"}を確認できませんでした。`);
   }
 }

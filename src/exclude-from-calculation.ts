@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { chromium, type Locator, type Page } from "playwright";
-import { excludeFromCalculation } from "./actions/exclude-from-calculation.js";
+import { setCalculationTarget } from "./actions/exclude-from-calculation.js";
 import { isDateInRange, parseDateRange, type DateRange } from "./date-range.js";
 
 type Candidate = {
@@ -13,9 +13,22 @@ type Candidate = {
   month: string;
 };
 
+type Target = {
+  account: string;
+  description: string | null;
+  shouldBeTarget: boolean;
+  sign: "plus" | "minus";
+};
+
 type TransactionDetails = Candidate & {
   isTransfer: boolean;
   isExcludedFromCalculation: boolean;
+};
+
+type HistoryScan = {
+  candidates: Candidate[];
+  complete: boolean;
+  stopReason: string | null;
 };
 
 const cashFlowUrl = "https://moneyforward.com/cf";
@@ -25,11 +38,27 @@ function normalize(value: string): string {
   return value.normalize("NFKC").replace(/\s+/g, "");
 }
 
-function getTargetAccount(): string {
-  const argument = process.argv.slice(2).find((value) => value.startsWith("--account="));
-  const account = argument?.slice("--account=".length).trim();
+function getTarget(): Target {
+  const arguments_ = process.argv.slice(2);
+  const options = new Map(
+    arguments_.flatMap((argument) => {
+      const separator = argument.indexOf("=");
+      return separator < 0 ? [] : [[argument.slice(0, separator), argument.slice(separator + 1)]];
+    }),
+  );
+  const account = options.get("--account")?.trim() ?? "";
+  const description = options.get("--description")?.trim() ?? "";
+  const target = options.get("--target") ?? "off";
+  const sign = options.get("--sign") ?? "minus";
   if (!account) throw new Error("--account=口座名を指定してください。");
-  return account;
+  if (target !== "on" && target !== "off") throw new Error("--target はonまたはoffを指定してください。");
+  if (sign !== "plus" && sign !== "minus") throw new Error("--sign はplusまたはminusを指定してください。");
+  return {
+    account,
+    description: description || null,
+    shouldBeTarget: target === "on",
+    sign,
+  };
 }
 
 async function getDisplayedMonth(page: Page): Promise<string> {
@@ -177,13 +206,14 @@ async function readTransactionDetails(row: Locator, month: string): Promise<Tran
 
 function isTarget(
   details: TransactionDetails,
-  targetAccount: string,
+  target: Target,
   dateRange: DateRange,
 ): boolean {
   return (
     isDateInRange(details.date, dateRange) &&
-    normalize(details.accountName) === normalize(targetAccount) &&
-    details.amount < 0 &&
+    normalize(details.accountName) === normalize(target.account) &&
+    (target.description === null || normalize(details.description) === normalize(target.description)) &&
+    (target.sign === "plus" ? details.amount > 0 : details.amount < 0) &&
     !details.isTransfer
   );
 }
@@ -191,14 +221,19 @@ function isTarget(
 async function collectCurrentMonth(
   page: Page,
   month: string,
-  targetAccount: string,
+  target: Target,
   dateRange: DateRange,
 ): Promise<Candidate[]> {
   const rows = page.locator("#cf-detail-table tbody tr[id^='js-transaction-']");
   const candidates: Candidate[] = [];
   for (let index = 0; index < (await rows.count()); index++) {
     const details = await readTransactionDetails(rows.nth(index), month);
-    if (!isTarget(details, targetAccount, dateRange) || details.isExcludedFromCalculation) continue;
+    if (
+      !isTarget(details, target, dateRange) ||
+      details.isExcludedFromCalculation === !target.shouldBeTarget
+    ) {
+      continue;
+    }
     const { isTransfer: _isTransfer, isExcludedFromCalculation: _isExcluded, ...candidate } = details;
     candidates.push(candidate);
   }
@@ -207,9 +242,9 @@ async function collectCurrentMonth(
 
 async function collectHistory(
   page: Page,
-  targetAccount: string,
+  target: Target,
   dateRange: DateRange,
-): Promise<Candidate[]> {
+): Promise<HistoryScan> {
   let currentMonth = await getDisplayedMonth(page);
   const latestMonth = dateRange.to.slice(0, 7);
   if (currentMonth > latestMonth) {
@@ -222,9 +257,10 @@ async function collectHistory(
   const seenIds = new Set<string>();
   let scannedMonths = 0;
   let displayedMonth = currentMonth;
+  let stopReason: string | null = null;
   while (earliestMonth === null || displayedMonth >= earliestMonth) {
     scannedMonths++;
-    for (const candidate of await collectCurrentMonth(page, displayedMonth, targetAccount, dateRange)) {
+    for (const candidate of await collectCurrentMonth(page, displayedMonth, target, dateRange)) {
       if (seenIds.has(candidate.id)) throw new Error("同じ明細IDが複数月に現れたため停止しました。");
       seenIds.add(candidate.id);
       candidates.push(candidate);
@@ -238,13 +274,19 @@ async function collectHistory(
       }),
     );
     if (displayedMonth === earliestMonth) break;
-    const previousMonth = await moveOneMonth(page, "previous");
+    let previousMonth: string | null;
+    try {
+      previousMonth = await moveOneMonth(page, "previous");
+    } catch (error: unknown) {
+      stopReason = error instanceof Error ? error.message : "前月へ移動できませんでした。";
+      break;
+    }
     if (!previousMonth) break;
     displayedMonth = previousMonth;
   }
 
   candidates.sort((left, right) => left.date.localeCompare(right.date));
-  return candidates;
+  return { candidates, complete: stopReason === null, stopReason };
 }
 
 async function findRowById(page: Page, id: string): Promise<Locator | null> {
@@ -259,7 +301,7 @@ async function findRowById(page: Page, id: string): Promise<Locator | null> {
 async function applyCandidate(
   page: Page,
   candidate: Candidate,
-  targetAccount: string,
+  target: Target,
   dateRange: DateRange,
 ): Promise<void> {
   await navigateToMonth(page, candidate.month);
@@ -268,8 +310,8 @@ async function applyCandidate(
 
   const details = await readTransactionDetails(row, candidate.month);
   if (
-    !isTarget(details, targetAccount, dateRange) ||
-    details.isExcludedFromCalculation ||
+    !isTarget(details, target, dateRange) ||
+    details.isExcludedFromCalculation === !target.shouldBeTarget ||
     details.date !== candidate.date ||
     details.description !== candidate.description ||
     details.amount !== candidate.amount ||
@@ -277,11 +319,11 @@ async function applyCandidate(
   ) {
     throw new Error("適用直前に明細が変化したため停止しました。");
   }
-  await excludeFromCalculation(page, row);
+  await setCalculationTarget(page, row, target.shouldBeTarget);
 }
 
 async function main(): Promise<void> {
-  const targetAccount = getTargetAccount();
+  const target = getTarget();
   const dateRange = parseDateRange(process.argv.slice(2));
   const apply = process.argv.includes("--apply");
   const summaryOnly = process.argv.includes("--summary-only");
@@ -303,8 +345,10 @@ async function main(): Promise<void> {
         throw new Error(`家計簿ページを読み込めませんでした (HTTP ${response.status()})。`);
       }
       await page.locator("#cf-detail-table").waitFor({ state: "visible", timeout: 15000 });
-      const candidates = await collectHistory(page, targetAccount, dateRange);
+      const scan = await collectHistory(page, target, dateRange);
+      const { candidates } = scan;
 
+      const targetState = target.shouldBeTarget ? "on" : "off";
       if (!apply) {
         if (!summaryOnly) {
           for (const candidate of candidates) {
@@ -314,17 +358,32 @@ async function main(): Promise<void> {
                 accountName: candidate.accountName,
                 description: candidate.description,
                 amount: candidate.amount,
-                action: "exclude-from-calculation",
+                action: `calculation-target-${targetState}`,
               }),
             );
           }
         }
-        console.log(JSON.stringify({ matchedCount: candidates.length, operation: "dry-run" }));
+        console.log(
+          JSON.stringify({
+            matchedCount: candidates.length,
+            target: targetState,
+            sign: target.sign,
+            complete: scan.complete,
+            stopReason: scan.stopReason,
+            operation: scan.complete ? "dry-run" : "dry-run-incomplete",
+          }),
+        );
         return;
       }
 
+      if (!scan.complete) {
+        throw new Error(`走査が未完了のためApplyを中止しました: ${scan.stopReason ?? "不明な停止理由"}`);
+      }
+
       if (candidates.length === 0) {
-        console.log(JSON.stringify({ matchedCount: 0, operation: "apply", succeeded: 0 }));
+        console.log(
+          JSON.stringify({ matchedCount: 0, target: targetState, sign: target.sign, operation: "apply", succeeded: 0 }),
+        );
         return;
       }
 
@@ -333,11 +392,13 @@ async function main(): Promise<void> {
         throw new Error(`家計簿ページを再読み込みできませんでした (HTTP ${refreshResponse.status()})。`);
       }
       await page.locator("#cf-detail-table").waitFor({ state: "visible", timeout: 15000 });
-      console.log(JSON.stringify({ matchedCount: candidates.length, operation: "apply-start" }));
+      console.log(
+        JSON.stringify({ matchedCount: candidates.length, target: targetState, sign: target.sign, operation: "apply-start" }),
+      );
       let succeeded = 0;
       for (const candidate of [...candidates].reverse()) {
         try {
-          await applyCandidate(page, candidate, targetAccount, dateRange);
+          await applyCandidate(page, candidate, target, dateRange);
           succeeded++;
           console.log(JSON.stringify({ date: candidate.date, status: "success" }));
         } catch (error: unknown) {
@@ -349,10 +410,18 @@ async function main(): Promise<void> {
               stop: true,
             }),
           );
-          throw new Error("計算対象OFFに失敗したため残りの対象を停止しました。");
+          throw new Error("計算対象の変更に失敗したため残りの対象を停止しました。");
         }
       }
-      console.log(JSON.stringify({ matchedCount: candidates.length, succeeded, operation: "apply-complete" }));
+      console.log(
+        JSON.stringify({
+          matchedCount: candidates.length,
+          succeeded,
+          target: targetState,
+          sign: target.sign,
+          operation: "apply-complete",
+        }),
+      );
     } finally {
       await context.close();
     }

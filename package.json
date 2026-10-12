@@ -9,12 +9,19 @@
     "inspect:transfer": "tsx src/inspect.ts --transfer",
     "dry-run": "tsx src/untransfer.ts",
     "apply": "tsx src/untransfer.ts --apply",
+    "dry-run:correct-transfer": "tsx src/correct-transfer.ts",
+    "dry-run:set-category": "tsx src/set-category.ts",
+    "apply:set-category": "tsx src/set-category.ts --apply",
+    "download:csv": "tsx src/download-csv.ts",
     "untransfer": "tsx src/untransfer.ts",
     "dry-run:exclude": "tsx src/exclude-from-calculation.ts",
     "apply:exclude": "tsx src/exclude-from-calculation.ts --apply",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/csv-combine.test.ts"
   },
   "dependencies": {
+    "csv-parse": "^7.0.3",
+    "csv-stringify": "^6.9.0",
     "playwright": "^1.55.0"
   },
   "devDependencies": {
